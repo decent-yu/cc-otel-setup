@@ -20,7 +20,8 @@
  *   - 三轴截断：max files / max bytes / per-file bytes
  *
  * argv：--session-id=<sid> --hook-kind=<session_start|session_end> \
- *       --event-kind=<session_start|user_prompt|stop> --cwd=<workspace>
+ *       --event-kind=<session_start|user_prompt|stop> --tool-kind=<cc|codex> \
+ *       --prompt-id=<prompt_or_turn_id> --turn-id=<codex_turn_id> --cwd=<workspace>
  *   hook_kind 是旧字段（保留给后端兼容），event_kind 是新字段（细粒度区分）
  */
 
@@ -304,12 +305,15 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
 // 增量(--not HEAD)：只含相对 HEAD 变化的对象，文件小；消费端凭 repo_url 取 HEAD 即可还原。
 // 无改动(snap 与 HEAD 同 tree)时 bundle 为空 → git 报错 → safeGit 吞掉 → 返回 ""（不传空文件）。
 // 返回落盘的文件名（= OTLP 事件里的连接键，清洗服务凭它把事件↔bundle↔OSS 路径对上）。
-function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRef) {
+function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRef, toolKind) {
   if (!rawBodiesDir || !snapRef) return "";
   try {
     fs.mkdirSync(rawBodiesDir, { recursive: true });
     const safe = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "_");
-    const fileName = `snapshot-${safe(sessionId)}-${ts}-${safe(eventKind)}.snapshot.bundle`;
+    // 保持 CC 既有文件名不变；Codex 显式加工具前缀，让共享 uploader 在不改
+    // spool 目录结构的前提下正确发送 tool_kind。
+    const toolPrefix = toolKind && toolKind !== "cc" ? `${safe(toolKind)}-` : "";
+    const fileName = `snapshot-${toolPrefix}${safe(sessionId)}-${ts}-${safe(eventKind)}.snapshot.bundle`;
     const bundlePath = path.join(rawBodiesDir, fileName);
     const hasHead = !!safeGit(cwd, ["rev-parse", "--verify", "HEAD"], 1000);
     // git bundle 需要真实 ref 作 tip（不能用裸 commit SHA）；用 createSnapshotCommit 写的 snap ref。
@@ -333,6 +337,9 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
     const hookKind = args["hook-kind"] || "session_start"; // 旧字段（兼容）
     const eventKind = args["event-kind"] || hookKind;      // 新字段（细粒度）
     const promptUuid = args["prompt-id"] || "";            // CC 原生 prompt.id（从 transcript 反查）
+    const turnId = args["turn-id"] || "";                  // Codex 原生 turn_id
+    const requestedToolKind = String(args["tool-kind"] || "cc").toLowerCase();
+    const toolKind = requestedToolKind === "codex" ? "codex" : "cc";
     const cwd = args["cwd"] || process.cwd();
     const cfg = readJSONSafe(path.join(__dirname, "endpoint.json"));
 
@@ -340,7 +347,7 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
       logEvent("git_snapshot_skip", { reason: "not_full_upload" });
       return;
     }
-    logEvent("git_snapshot_start", { hookKind, eventKind, sessionId, cwd });
+    logEvent("git_snapshot_start", { hookKind, eventKind, toolKind, sessionId, cwd });
 
     const budget = {
       maxFiles: Number(cfg.gitSnapshotMaxFiles) || DEFAULT_MAX_FILES,
@@ -400,20 +407,23 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
     const repoRoot = safeGit(cwd, ["rev-parse", "--show-toplevel"], 1000).trim();
     const repoUrl = safeGit(cwd, ["config", "--get", "remote.origin.url"], 1000).trim();
     const sourceLabel = (k) => (k === "user_prompt" ? "prompt_submit_hook" : "current_workspace");
-    const bundleFile = snap ? writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snap.refname) : "";
+    const bundleFile = snap
+      ? writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snap.refname, toolKind)
+      : "";
     // env_vars 全量（业务要求）；脱敏由后期清洗服务处理
     const envVars = JSON.stringify(Object.entries(process.env).map(([k, v]) => `${k}=${v}`));
 
     const attrs = {
-      "tool_kind": "cc",
+      "tool_kind": toolKind,
       "event.name": "hook_git_snapshot",
       "event.timestamp": new Date(ts).toISOString(),
       "session.id": sessionId,
       "hook_kind": hookKind,                              // legacy
       "snapshot.event_kind": eventKind,                   // new: session_start|user_prompt|stop
-      // CC 原生 prompt UUID（跟 user_prompt / api_request* event 的 prompt.id 完全一致；
-      // 后端按它 join 就能把 hook_git_snapshot 跟 prompt 的全部 OTel 事件串起来）
+      // CC 传原生 prompt UUID；Codex 传 Hook 的 turn_id。两者都放 prompt.id，
+      // 同时为 Codex 保留 snapshot.turn_id，便于下游在字段可用时直接 join。
       "prompt.id": promptUuid,
+      "snapshot.turn_id": turnId,
       "snapshot.prompt_seq": promptId,                    // 我们派生的 session 内序号 p_0/p_1/...
       "snapshot.seq": String(ts),                         // unix_ms（ref 名里的那个数）
       "snapshot.is_first_frame": String(isFirstFrame),
@@ -489,6 +499,7 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
       truncatedFileCount: truncatedFiles.length,
       hookKind,
       eventKind,
+      toolKind,
       promptSeq: promptId,
       hasPromptUuid: !!promptUuid,
       hasSnapshotRef: !!(snap && snap.refname),

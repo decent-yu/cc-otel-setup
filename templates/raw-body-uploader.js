@@ -81,6 +81,13 @@ function fileBodyKind(fileName) {
   return "";
 }
 
+function fileToolKind(fileName) {
+  // CC 旧文件名保持 snapshot-<session>-...；Codex 快照由通用 snapshot
+  // 引擎写成 snapshot-codex-<session>-...。request/response 仍只来自 CC。
+  if (/^snapshot-codex-/i.test(fileName)) return "codex";
+  return "cc";
+}
+
 function isRawBodyFile(fileName) {
   return /\.request\.json$/i.test(fileName) || /\.response\.json$/i.test(fileName) || /\.snapshot\.bundle$/i.test(fileName);
 }
@@ -360,7 +367,7 @@ async function uploadFile(file, stat, cfg, token) {
   const key = sourceFileKey(machineId, file, stat);
   const metadata = {
     machine_id: machineId,
-    tool_kind: "cc",
+    tool_kind: fileToolKind(fileName),
     file_name: fileName,
     body_kind: fileBodyKind(fileName),
     file_size: stat.size,
@@ -758,9 +765,16 @@ async function run() {
   }
 }
 
-run().catch((e) => {
-  logEvent("raw_uploader_failed", {
-    error: e && e.message ? e.message : "unknown",
+if (require.main === module) {
+  run().catch((e) => {
+    logEvent("raw_uploader_failed", {
+      error: e && e.message ? e.message : "unknown",
+    });
+    process.exit(1);
   });
-  process.exit(1);
-});
+}
+
+module.exports.__test__ = {
+  fileBodyKind,
+  fileToolKind,
+};

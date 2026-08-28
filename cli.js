@@ -1135,7 +1135,7 @@ function escapeXml(s) {
 //   command = "..."
 //
 // 重跑 installer 时按【内容键控】清理我方写入：otel 走 stripCodexOtel（整个 [otel]
-// 命名空间），hook 走 stripAiOtelSessionStartHooks（命令签名）。不再依赖 BEGIN/END
+// 命名空间），hook 走 stripAiOtelCodexHooks（命令签名）。不再依赖 BEGIN/END
 // 注释标记——codex 重写 config.toml 时会丢注释、抹掉 marker，标记块会被孤立成残留。
 // 下面两个常量仅供 stripCodexManagedBlock 迁移老用户的旧 marker 块用，新写入不再产生。
 const CODEX_MANAGED_BEGIN = "# >>> ai-otel-setup managed >>>";
@@ -1166,12 +1166,16 @@ function extractHooksState(text) {
   return { text: text.replace(re, "\n"), state: m[0].trim() };
 }
 
-// F2：删除任意 ai-otel 的 SessionStart hook（命令同时含 launch-hook.js + on-session-start.js），
-// 不论在不在 managed marker 内、单引号还是转义双引号——消除 codex 把 hook 规范化搬到 marker 外
-// 造成的永久重复。按"我们自己的命令签名"匹配，绝不误删用户的其它 SessionStart hook。
-// 组边界 = 下一个 [[hooks.SessionStart]] 同级组 / 下一个非 [[hooks.SessionStart.hooks]] 顶层表 / EOF。
-function stripAiOtelSessionStartHooks(text) {
-  const groupRe = /(?:\n|^)\[\[hooks\.SessionStart\]\][\s\S]*?(?=\n\[\[hooks\.SessionStart\]\]|\n\[(?!\[hooks\.SessionStart\.hooks\]\])|$)/g;
+// F2：删除任意 ai-otel 的 Codex lifecycle hook（命令同时含 launch-hook.js +
+// on-session-start.js）。覆盖 SessionStart / UserPromptSubmit / Stop，按命令签名
+// 清理但保留用户自己的 hook；兼容 Codex 规范化 config.toml 后注释和位置变化。
+function stripAiOtelCodexHooks(text) {
+  const event = "(?:SessionStart|UserPromptSubmit|Stop)";
+  const groupRe = new RegExp(
+    `(?:\\n|^)\\[\\[hooks\\.${event}\\]\\][\\s\\S]*?` +
+      `(?=\\n\\[\\[hooks\\.${event}\\]\\]|\\n\\[(?!\\[hooks\\.${event}\\.hooks\\]\\])|$)`,
+    "g"
+  );
   return text.replace(groupRe, (m) =>
     /launch-hook\.js/.test(m) && /on-session-start\.js/.test(m) ? "\n" : m
   );
@@ -1290,10 +1294,25 @@ function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport
     "[[hooks.SessionStart.hooks]]",
     'type = "command"',
     `command = ${JSON.stringify(buildHookCommand(launcherDest, hookDest))}`,
+    "timeout = 3",
+    "",
+    "[[hooks.UserPromptSubmit]]",
+    "",
+    "[[hooks.UserPromptSubmit.hooks]]",
+    'type = "command"',
+    `command = ${JSON.stringify(buildHookCommand(launcherDest, hookDest))}`,
+    "timeout = 3",
+    "",
+    "[[hooks.Stop]]",
+    "",
+    "[[hooks.Stop.hooks]]",
+    'type = "command"',
+    `command = ${JSON.stringify(buildHookCommand(launcherDest, hookDest))}`,
+    "timeout = 3",
   ].join("\n");
 }
 
-function installCodex(home, endpoint, otelTransport, gitUser) {
+function installCodex(home, endpoint, otelTransport, gitUser, snapshotConfig = {}) {
   const codexDir = path.join(home, ".codex");
   if (!fs.existsSync(codexDir)) {
     return { tool: "codex", status: "skipped", reason: "未检测到 ~/.codex" };
@@ -1311,6 +1330,11 @@ function installCodex(home, endpoint, otelTransport, gitUser) {
   const localUsageScannerDest = path.join(installDir, "local-usage-scanner.js");
   fs.copyFileSync(path.join(__dirname, "templates", "local-usage-scanner.js"), localUsageScannerDest);
   fs.chmodSync(localUsageScannerDest, 0o755);
+  // Codex 与 Claude Code 复用同一个快照引擎。bundle 写入共享 rawBodiesDir，
+  // 由现有单实例 uploader/timer 上传，避免每台机器安装两套竞争 timer。
+  const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
+  fs.copyFileSync(path.join(__dirname, "templates", "git-snapshot.js"), gitSnapshotDest);
+  fs.chmodSync(gitSnapshotDest, 0o755);
   const machineId = getOrCreateMachineId(installDir);
   writeInstallLog(installDir, "codex", endpoint, otelTransport);
   const bak = backup(configPath);
@@ -1323,7 +1347,7 @@ function installCodex(home, endpoint, otelTransport, gitUser) {
   // 先剥离我们上次写的内容和旧 schema 残留，再保证用户块里有 hooks = true。
   // stripCodexManagedBlock 仍保留：迁移老用户残留的 BEGIN/END marker 块，无标记时是 no-op。
   existing = stripCodexManagedBlock(existing);
-  existing = stripAiOtelSessionStartHooks(existing); // F2：按命令签名删 ai-otel SessionStart（含 codex 规范化搬走的）
+  existing = stripAiOtelCodexHooks(existing);        // F2：按命令签名删我方三类 lifecycle hook
   existing = stripCodexOtel(existing);               // 删整个 [otel] 命名空间，避免重复声明
   existing = stripLegacyCodexHook(existing);
   existing = stripLegacyCodexHooksFlag(existing);
@@ -1333,9 +1357,18 @@ function installCodex(home, endpoint, otelTransport, gitUser) {
   // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
   // machineId + localUsageUrl 是 local-usage-scanner.js 必需的两个字段（scanner 读 endpoint.json）。
   writeJSONAtomic(path.join(installDir, "endpoint.json"), {
-    ...buildEndpointConfig(endpoint, otelTransport),
+    ...buildFullEndpointConfig(endpoint, otelTransport),
+    // Codex hook 与 git-snapshot.js 自己发 OTLP/HTTP，不能沿用原生 exporter
+    // 的 gRPC 端口；域名场景也必须去掉生产 gRPC 端口并落到 /v1/logs。
+    logsEndpoint: logsEndpointFromGrpc(endpoint),
     machineId,
     localUsageUrl: deriveLocalUsageUrl(endpoint),
+    installerVersion: PKG_VERSION,
+    fullUpload: snapshotConfig.fullUpload === true,
+    rawBodiesDir: snapshotConfig.rawBodiesDir || "",
+    gitSnapshotMaxFiles: snapshotConfig.gitSnapshotMaxFiles || 20,
+    gitSnapshotMaxBytes: snapshotConfig.gitSnapshotMaxBytes || 1 * 1024 * 1024,
+    gitSnapshotPerFileBytes: snapshotConfig.gitSnapshotPerFileBytes || 256 * 1024,
   });
   const otelHook = buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport, gitUser);
   // F1：信任库放回末尾（我方写入块之外），下次 strip 不会再误删；命令未变 → trusted_hash 仍匹配 → hook 持续受信。
@@ -1623,7 +1656,13 @@ async function main() {
 
   const results = [];
   try {
-    results.push(installCodex(home, endpoint, otelTransport, gitUser));
+    results.push(installCodex(home, endpoint, otelTransport, gitUser, {
+      fullUpload,
+      rawBodiesDir,
+      gitSnapshotMaxFiles: 20,
+      gitSnapshotMaxBytes: 1 * 1024 * 1024,
+      gitSnapshotPerFileBytes: 256 * 1024,
+    }));
   } catch (e) {
     results.push({ tool: "codex", status: "failed", reason: e.message });
   }
@@ -1723,4 +1762,7 @@ if (require.main === module) {
 
 module.exports.__test__ = {
   buildCodexOtelBlock,
+  buildCodexOtelHookBlock,
+  stripAiOtelCodexHooks,
+  installCodex,
 };

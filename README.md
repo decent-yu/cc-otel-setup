@@ -41,9 +41,10 @@ npx -y ai-otel-setup url=collector服务地址
 
 ## 安装后会做什么
 
-- 在 `~/.claude/cc-otel/` 放一个启动脚本
+- 在 `~/.claude/cc-otel/`、`~/.codex/ai-otel/` 放置启动与采集脚本
 - 备份你原来的 `~/.claude/settings.json`（带时间戳，可随时还原）
-- 把上报相关配置写进 `~/.claude/settings.json`
+- 备份 Codex 的 `~/.codex/config.toml`，写入 `SessionStart`、`UserPromptSubmit`、`Stop` hooks
+- 把上报相关配置写进 Claude Code、Codex 和 Gemini 的用户配置
 
 你原本的其他设置都会保留；重复运行不会产生重复条目，可以放心重装。
 
@@ -52,7 +53,9 @@ npx -y ai-otel-setup url=collector服务地址
 | 类型 | 内容 |
 |---|---|
 | 会采集 | 调用了哪些工具、每次耗时、是否成功、Token 用量、当前目录、Git 信息 |
-| 仅全量上报旁路采集 | raw body 与 git snapshot，用于完整排查和全量数据看板 |
+| 仅全量上报旁路采集 | Claude Code raw body，以及 Claude Code / Codex 工作区 git snapshot，用于完整排查和全量数据看板 |
+
+Codex 工作区快照使用隐藏 Git ref 和临时 index，不修改当前 branch、HEAD 或用户的 staged 状态。快照 bundle 与 Claude Code 共用 `~/.claude/cc-otel/raw-bodies/` 上传队列；使用 `--no-full-upload` 会同时关闭两种工具的快照采集。
 
 ## 本地用量补报
 
@@ -109,6 +112,7 @@ schtasks /Delete /F /TN ai-otel-raw-uploader
 | 现象 | 怎么办 |
 |---|---|
 | 启动 `claude` 没看到上报动作 | 打开 `~/.claude/settings.json`，确认里面有一项 `id: team:session-start` |
+| Codex 没有工作区快照 | 在 Codex 中运行 `/hooks`，确认 `SessionStart`、`UserPromptSubmit`、`Stop` 三类 ai-otel hooks 已审阅并信任 |
 | 服务器一直收不到数据 | 用团队提供的地址和端口做连通性检查；IP 测试地址通常检查 `4317`，生产域名通常检查团队提供的 gRPC 端口 |
 | 想换服务器地址 | 直接重跑安装命令即可，会自动覆盖旧配置 |
 
