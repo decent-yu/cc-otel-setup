@@ -76,6 +76,7 @@ test("installAcode writes endpoint and AStudio hooks while preserving user hooks
 
 test("installAcode is idempotent and replaces only its managed hooks", () => {
   const home = tempHome();
+  fs.mkdirSync(path.join(home, ".acode", "acode", "acode-home-overlay"), { recursive: true });
   const args = [home, "https://collector.example.invalid:24317", "http", { email: "a@example.invalid" }];
 
   __test__.installAcode(...args);
@@ -87,6 +88,8 @@ test("installAcode is idempotent and replaces only its managed hooks", () => {
   assert.equal(hooks.hooks.Stop[0].hooks.length, 1);
   assert.equal(hooks.hooks.UserPromptSubmit[0].hooks.length, 1);
   const config = fs.readFileSync(path.join(home, ".acode", "config.toml"), "utf8");
-  assert.equal((config.match(/hooks\.state\..*user_prompt_submit:0:0/g) || []).length, 1);
-  assert.equal((config.match(/hooks\.state\..*stop:0:0/g) || []).length, 1);
+  assert.equal((config.match(/hooks\.state\..*user_prompt_submit:0:0/g) || []).length, 2);
+  assert.equal((config.match(/hooks\.state\..*stop:0:0/g) || []).length, 2);
+  assert.match(config, /acode-home-overlay\\\\hooks\.json:user_prompt_submit:0:0/);
+  assert.match(config, /acode-home-overlay\\\\hooks\.json:stop:0:0/);
 });

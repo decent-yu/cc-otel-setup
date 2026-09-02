@@ -1257,25 +1257,27 @@ function enableAcodeHooksFeature(text) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-function mergeAcodeHookTrustConfig(existing, hooksPath, hooksDocument) {
+function mergeAcodeHookTrustConfig(existing, hooksPaths, hooksDocument) {
   const managedHeaders = new Set();
   const sections = [];
-  for (const eventName of ["UserPromptSubmit", "Stop"]) {
-    const groups = hooksDocument.hooks && hooksDocument.hooks[eventName];
-    if (!Array.isArray(groups)) continue;
-    groups.forEach((group, groupIndex) => {
-      const handlers = group && Array.isArray(group.hooks) ? group.hooks : [];
-      handlers.forEach((handler, handlerIndex) => {
-        if (!isManagedAcodeHookHandler(handler)) return;
-        const header = acodeHookStateHeader(hooksPath, eventName, groupIndex, handlerIndex);
-        managedHeaders.add(header);
-        sections.push([
-          header,
-          "enabled = true",
-          `trusted_hash = "${acodeCommandHookTrustedHash(eventName, group, handler)}"`,
-        ].join("\n"));
+  for (const hooksPath of hooksPaths) {
+    for (const eventName of ["UserPromptSubmit", "Stop"]) {
+      const groups = hooksDocument.hooks && hooksDocument.hooks[eventName];
+      if (!Array.isArray(groups)) continue;
+      groups.forEach((group, groupIndex) => {
+        const handlers = group && Array.isArray(group.hooks) ? group.hooks : [];
+        handlers.forEach((handler, handlerIndex) => {
+          if (!isManagedAcodeHookHandler(handler)) return;
+          const header = acodeHookStateHeader(hooksPath, eventName, groupIndex, handlerIndex);
+          managedHeaders.add(header);
+          sections.push([
+            header,
+            "enabled = true",
+            `trusted_hash = "${acodeCommandHookTrustedHash(eventName, group, handler)}"`,
+          ].join("\n"));
+        });
       });
-    });
+    }
   }
   const retained = removeTomlSectionsByHeader(existing, managedHeaders);
   const enabled = enableAcodeHooksFeature(retained).trimEnd();
@@ -1332,7 +1334,10 @@ function installAcode(home, endpoint, otelTransport, gitUser) {
   const configBak = backup(configPath);
   writeJSONAtomic(hooksPath, mergedHooks);
   const existingConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
-  fs.writeFileSync(configPath, mergeAcodeHookTrustConfig(existingConfig, hooksPath, mergedHooks), "utf8");
+  const trustedHookPaths = [hooksPath];
+  const astudioOverlayDir = path.join(acodeDir, "acode", "acode-home-overlay");
+  if (fs.existsSync(astudioOverlayDir)) trustedHookPaths.push(path.join(astudioOverlayDir, "hooks.json"));
+  fs.writeFileSync(configPath, mergeAcodeHookTrustConfig(existingConfig, trustedHookPaths, mergedHooks), "utf8");
   writeInstallLog(installDir, "acode", endpoint, otelTransport);
   return { tool: "acode", status: "installed", path: hooksPath, backup: bak, configPath, configBackup: configBak };
 }
