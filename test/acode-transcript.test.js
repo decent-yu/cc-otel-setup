@@ -9,6 +9,7 @@ const {
   traceIdFor,
   spanIdFor,
 } = require("../templates/acode/transcript-parser");
+const { __test__: hookTest } = require("../templates/acode/on-session-start");
 
 function line(timestamp, type, payload) {
   return JSON.stringify({ timestamp, type, payload });
@@ -151,4 +152,14 @@ test("builds deterministic OTLP Logs with Acode identity and GenAI fields", () =
   assert.match(attrs["gen_ai.output.messages"], /I found the file/);
   assert.equal(records[0].traceId, traceIdFor("session-1", "turn-1"));
   assert.equal(records[0].spanId, spanIdFor("session-1", "turn-1", "turn"));
+});
+
+test("AStudio hook resolves an explicit logs endpoint and classifies lifecycle events", () => {
+  assert.equal(
+    hookTest.resolveEndpoint({ logsEndpoint: "http://127.0.0.1:4318/v1/logs" }),
+    "http://127.0.0.1:4318/v1/logs",
+  );
+  assert.equal(hookTest.resolveEndpoint({ endpoint: "https://collector.example.invalid:24317" }), "https://collector.example.invalid:24317/v1/logs");
+  assert.equal(hookTest.eventKind({ hook_event_name: "Stop" }), "stop");
+  assert.equal(hookTest.eventKind({ hook_event_name: "UserPromptSubmit" }), "user_prompt");
 });
