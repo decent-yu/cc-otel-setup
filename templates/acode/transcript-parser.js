@@ -120,8 +120,57 @@ function createTurn(id, startedAt) {
     model: null,
     messages: [],
     tool_calls: [],
+    llm_calls: [],
+    raw_events: [],
     usage: null,
+    _open_assistant_indexes: [],
+    _pending_assistant_groups: [],
   };
+}
+
+function addUsage(left, right) {
+  if (!right || typeof right !== "object") return left;
+  const result = { ...(left || {}) };
+  for (const key of ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"]) {
+    if (Number.isFinite(right[key])) result[key] = (result[key] || 0) + right[key];
+  }
+  return result;
+}
+
+function closeAssistantGroup(turn) {
+  if (turn._open_assistant_indexes.length === 0) return;
+  turn._pending_assistant_groups.push(turn._open_assistant_indexes);
+  turn._open_assistant_indexes = [];
+}
+
+function finalizeLlmCall(turn, usage, timestamp) {
+  const indexes = turn._open_assistant_indexes.length > 0
+    ? turn._open_assistant_indexes.splice(0)
+    : turn._pending_assistant_groups.shift();
+  if (!indexes || indexes.length === 0) return false;
+  const firstIndex = indexes[0];
+  const outputMessages = indexes.map((index) => turn.messages[index]);
+  const inputMessages = turn.messages.slice(0, firstIndex);
+  turn.llm_calls.push({
+    index: turn.llm_calls.length,
+    first_message_index: firstIndex,
+    started_at: inputMessages.at(-1)?.timestamp || turn.started_at,
+    completed_at: timestamp || outputMessages.at(-1)?.timestamp,
+    input_messages: inputMessages,
+    output_messages: outputMessages,
+    raw_input_items: inputMessages.map((message) => message.raw).filter(Boolean),
+    raw_output_items: outputMessages.map((message) => message.raw).filter(Boolean),
+    usage: usage && Object.keys(usage).length > 0 ? usage : null,
+  });
+  if (usage && Object.keys(usage).length > 0) turn.usage = addUsage(turn.usage, usage);
+  return true;
+}
+
+function orderLlmCalls(turn) {
+  turn.llm_calls.sort((left, right) => left.first_message_index - right.first_message_index);
+  turn.llm_calls.forEach((call, index) => {
+    call.index = index;
+  });
 }
 
 function toolFor(turn, id) {
@@ -142,9 +191,11 @@ function applyToolMessage(turn, message, timestamp) {
     tool.name = message.tool_name || tool.name;
     tool.arguments = message.arguments;
     tool.started_at = tool.started_at || timestamp;
+    tool.raw_call = message.raw;
   } else {
     tool.result = message.content;
     tool.ended_at = timestamp;
+    tool.raw_result = message.raw;
   }
 }
 
@@ -169,6 +220,7 @@ function parseTranscript(input, hookInput = {}) {
     model_provider: firstValue(hookInput.model_provider, hookInput.modelProvider, null),
     model: firstValue(hookInput.model, null),
     transcript_path: firstValue(hookInput.transcript_path, null),
+    raw_meta: null,
   };
   const allTurns = [];
   let current = null;
@@ -181,6 +233,9 @@ function parseTranscript(input, hookInput = {}) {
 
   function finishTurn(status, timestamp, lastMessage) {
     if (!current) return;
+    closeAssistantGroup(current);
+    while (current._pending_assistant_groups.length > 0) finalizeLlmCall(current, null, timestamp);
+    orderLlmCalls(current);
     current.status = status || current.status;
     current.completed_at = timestamp || current.completed_at;
     if (lastMessage && !current.messages.some((message) => message.content === lastMessage)) {
@@ -193,6 +248,21 @@ function parseTranscript(input, hookInput = {}) {
   for (const line of lines) {
     const payload = asObject(line.payload);
     const timestamp = line.timestamp || null;
+    const rawEvent = { timestamp: line.timestamp, type: line.type, payload: line.payload };
+    const eventType = line.type === "event_msg" ? payload.type || "" : "";
+    if (eventType === "task_started" || eventType === "turn_started") {
+      if (current && current.messages.length > 0) {
+        closeAssistantGroup(current);
+        while (current._pending_assistant_groups.length > 0) finalizeLlmCall(current, null, timestamp);
+        orderLlmCalls(current);
+        allTurns.push(current);
+      }
+      current = createTurn(payload.turn_id || null, timestamp);
+      current.model = firstValue(payload.model, current.model);
+      current.start_line = line._line;
+      current.raw_events.push(rawEvent);
+      continue;
+    }
     if (line.type === "session_meta") {
       session.session_id = firstValue(payload.id, payload.session_id, payload.sessionId, session.session_id);
       session.thread_id = firstValue(payload.thread_id, payload.threadId, session.thread_id);
@@ -200,8 +270,10 @@ function parseTranscript(input, hookInput = {}) {
       session.cwd = firstValue(payload.cwd, session.cwd);
       session.model_provider = firstValue(payload.model_provider, payload.modelProvider, session.model_provider);
       session.model = firstValue(payload.model, session.model);
+      session.raw_meta = payload;
       continue;
     }
+    if (current) current.raw_events.push(rawEvent);
     if (line.type === "turn_context") {
       const turn = ensureTurn(timestamp, payload.turn_id);
       turn.model = firstValue(payload.model, turn.model);
@@ -211,24 +283,19 @@ function parseTranscript(input, hookInput = {}) {
     if (line.type === "response_item") {
       const turn = ensureTurn(timestamp, null);
       const message = normalizeMessage(payload);
-      turn.messages.push({ ...message, timestamp, line: line._line });
-      if (message.type === "tool_call" || message.type === "tool_result") applyToolMessage(turn, message, timestamp);
+      if (message.role !== "assistant") closeAssistantGroup(turn);
+      const entry = { ...message, raw: payload, timestamp, line: line._line };
+      const messageIndex = turn.messages.push(entry) - 1;
+      if (message.role === "assistant") turn._open_assistant_indexes.push(messageIndex);
+      if (message.type === "tool_call" || message.type === "tool_result") applyToolMessage(turn, entry, timestamp);
       continue;
     }
     if (line.type !== "event_msg") continue;
-    const eventType = payload.type || "";
-    if (eventType === "task_started" || eventType === "turn_started") {
-      if (current && current.messages.length > 0) allTurns.push(current);
-      current = createTurn(payload.turn_id || null, timestamp);
-      current.model = firstValue(payload.model, current.model);
-      current.start_line = line._line;
-      continue;
-    }
     if (eventType === "token_count") {
       const turn = ensureTurn(timestamp, null);
       const info = asObject(payload.info);
       const usage = asObject(firstValue(info.last_token_usage, info.total_token_usage, null));
-      if (Object.keys(usage).length > 0) turn.usage = usage;
+      finalizeLlmCall(turn, usage, timestamp);
       continue;
     }
     if (typeof payload.call_id === "string") {
@@ -240,12 +307,14 @@ function parseTranscript(input, hookInput = {}) {
         tool.arguments = firstValue(payload.arguments, payload.input, payload.query, tool.arguments);
         tool.started_at = timestamp;
         tool.status = "started";
+        tool.raw_begin = payload;
       }
       if (event.endsWith("_end")) {
         tool.result = firstValue(payload.result, payload.output, payload.aggregated_output, payload.invocation, tool.result);
         tool.ended_at = timestamp;
         tool.status = firstValue(payload.status, tool.status);
         tool.error = firstValue(payload.error, payload.stderr, null);
+        tool.raw_end = payload;
       }
       continue;
     }
@@ -256,6 +325,9 @@ function parseTranscript(input, hookInput = {}) {
     if (eventType === "turn_aborted") finishTurn("aborted", timestamp, null);
   }
   if (current) {
+    closeAssistantGroup(current);
+    while (current._pending_assistant_groups.length > 0) finalizeLlmCall(current, null, current.completed_at);
+    orderLlmCalls(current);
     if (current.status === "in_progress" && current.messages.some((message) => message.role === "assistant")) current.status = "completed";
     allTurns.push(current);
   }
@@ -311,10 +383,18 @@ function buildOtlpLogs(parsed, options = {}) {
     "turn.id": turn.turn_id,
     "turn.status": turn.status,
   };
-  const userMessages = turn.messages.filter((message) => message.role === "user");
-  const assistantMessages = turn.messages.filter((message) => message.role === "assistant");
   const start = turn.started_at || turn.messages[0]?.timestamp;
   const end = turn.completed_at || turn.messages.at(-1)?.timestamp || start;
+  const llmCalls = turn.llm_calls.length > 0 ? turn.llm_calls : [{
+    index: 0,
+    started_at: start,
+    completed_at: end,
+    input_messages: turn.messages.slice(0, Math.max(0, turn.messages.findIndex((message) => message.role === "assistant"))),
+    output_messages: turn.messages.filter((message) => message.role === "assistant"),
+    raw_input_items: turn.messages.filter((message) => message.role !== "assistant").map((message) => message.raw).filter(Boolean),
+    raw_output_items: turn.messages.filter((message) => message.role === "assistant").map((message) => message.raw).filter(Boolean),
+    usage: turn.usage,
+  }];
   records.push({
     timeUnixNano: nano(end),
     traceId,
@@ -324,8 +404,11 @@ function buildOtlpLogs(parsed, options = {}) {
       ...common,
       "event.name": "agent.turn",
       "gen_ai.operation.name": "agent",
-      "gen_ai.input.messages": messagesJson(userMessages),
-      "gen_ai.output.messages": messagesJson(assistantMessages),
+      "capture.fidelity": "transcript_reconstructed",
+      "turn.llm_call_count": llmCalls.length,
+      "turn.tool_call_count": turn.tool_calls.length,
+      "acode.raw.session_meta": session.raw_meta,
+      "acode.raw.turn.events": turn.raw_events,
       "gen_ai.usage.input_tokens": turn.usage?.input_tokens,
       "gen_ai.usage.output_tokens": turn.usage?.output_tokens,
       "gen_ai.usage.total_tokens": turn.usage?.total_tokens,
@@ -333,23 +416,32 @@ function buildOtlpLogs(parsed, options = {}) {
       "start.time": start,
     }),
   });
-  records.push({
-    timeUnixNano: nano(end),
-    traceId,
-    spanId: spanIdFor(session.session_id, turn.turn_id, "llm"),
-    parentSpanId: spanIdFor(session.session_id, turn.turn_id, "turn"),
-    body: { stringValue: "llm.request" },
-    attributes: attrs({
-      ...common,
-      "event.name": "llm.request",
-      "gen_ai.operation.name": "chat",
-      "gen_ai.input.messages": messagesJson(turn.messages.slice(0, Math.max(0, turn.messages.findIndex((message) => message.role === "assistant")))),
-      "gen_ai.output.messages": messagesJson(assistantMessages),
-      "gen_ai.usage.input_tokens": turn.usage?.input_tokens,
-      "gen_ai.usage.output_tokens": turn.usage?.output_tokens,
-      "gen_ai.usage.total_tokens": turn.usage?.total_tokens,
-      "gen_ai.usage.reasoning.output_tokens": turn.usage?.reasoning_output_tokens,
-    }),
+  llmCalls.forEach((call, index) => {
+    records.push({
+      timeUnixNano: nano(call.completed_at || end),
+      traceId,
+      spanId: spanIdFor(session.session_id, turn.turn_id, "llm", index),
+      parentSpanId: spanIdFor(session.session_id, turn.turn_id, "turn"),
+      body: { stringValue: "llm.request" },
+      attributes: attrs({
+        ...common,
+        "event.name": "llm.request",
+        "gen_ai.operation.name": "chat",
+        "llm.call.index": index,
+        "capture.fidelity": "transcript_reconstructed",
+        "gen_ai.input.messages": messagesJson(call.input_messages),
+        "gen_ai.output.messages": messagesJson(call.output_messages),
+        "acode.raw.input.items": call.raw_input_items,
+        "acode.raw.output.items": call.raw_output_items,
+        "gen_ai.usage.input_tokens": call.usage?.input_tokens,
+        "gen_ai.usage.output_tokens": call.usage?.output_tokens,
+        "gen_ai.usage.total_tokens": call.usage?.total_tokens,
+        "gen_ai.usage.cache_read.input_tokens": call.usage?.cached_input_tokens,
+        "gen_ai.usage.reasoning.output_tokens": call.usage?.reasoning_output_tokens,
+        "llm.start_time": call.started_at,
+        "llm.end_time": call.completed_at,
+      }),
+    });
   });
   turn.tool_calls.forEach((tool, index) => {
     records.push({
@@ -366,6 +458,10 @@ function buildOtlpLogs(parsed, options = {}) {
         "gen_ai.tool.call.id": tool.call_id,
         "gen_ai.tool.call.arguments": tool.arguments,
         "gen_ai.tool.call.result": tool.result,
+        "acode.raw.tool.call": tool.raw_call || tool.raw_begin,
+        "acode.raw.tool.result": tool.raw_result || tool.raw_end,
+        "acode.raw.tool.begin_event": tool.raw_begin,
+        "acode.raw.tool.end_event": tool.raw_end,
         "tool.status": tool.status,
         "tool.error": tool.error,
         "tool.start_time": tool.started_at,

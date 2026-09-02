@@ -17,6 +17,7 @@ const PENDING_DIR = path.join(INSTALL_DIR, "pending");
 const SENT_DIR = path.join(INSTALL_DIR, "sent");
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MAX_JOB_FILES = 10;
+const DEFAULT_MAX_BATCH_BYTES = 1500000;
 
 function configPath() {
   return path.join(INSTALL_DIR, "endpoint.json");
@@ -76,6 +77,41 @@ function parseHeaders(value) {
     if (key && headerValue) result[key] = headerValue;
   }
   return result;
+}
+
+function payloadWithRecords(payload, records) {
+  const resourceLog = payload.resourceLogs[0];
+  const scopeLog = resourceLog.scopeLogs[0];
+  return {
+    resourceLogs: [{
+      ...resourceLog,
+      scopeLogs: [{ ...scopeLog, logRecords: records }],
+    }],
+  };
+}
+
+function splitOtlpLogs(payload, maxBytes = DEFAULT_MAX_BATCH_BYTES) {
+  const resourceLog = payload.resourceLogs?.[0];
+  const scopeLog = resourceLog?.scopeLogs?.[0];
+  const records = scopeLog?.logRecords || [];
+  if (records.length === 0) return [payload];
+  const batches = [];
+  let current = [];
+  for (const record of records) {
+    const candidate = [...current, record];
+    if (Buffer.byteLength(JSON.stringify(payloadWithRecords(payload, candidate))) <= maxBytes) {
+      current = candidate;
+      continue;
+    }
+    if (current.length === 0) throw new Error(`single OTLP log record exceeds ${maxBytes} bytes`);
+    batches.push(payloadWithRecords(payload, current));
+    current = [record];
+    if (Buffer.byteLength(JSON.stringify(payloadWithRecords(payload, current))) > maxBytes) {
+      throw new Error(`single OTLP log record exceeds ${maxBytes} bytes`);
+    }
+  }
+  if (current.length > 0) batches.push(payloadWithRecords(payload, current));
+  return batches;
 }
 
 function postJson(endpoint, payload, config) {
@@ -150,11 +186,17 @@ async function processJob(jobPath) {
       serviceName: "acode",
       serviceVersion: readConfig().installerVersion || "unknown",
     });
-    const result = await postJson(resolveEndpoint(readConfig()), payload, readConfig());
+    const config = readConfig();
+    const batches = splitOtlpLogs(payload, Number(config.maxBatchBytes) || DEFAULT_MAX_BATCH_BYTES);
+    let result = { statusCode: 200 };
+    for (const batch of batches) {
+      result = await postJson(resolveEndpoint(config), batch, config);
+      if (result.statusCode < 200 || result.statusCode >= 300) break;
+    }
     if (result.statusCode >= 200 && result.statusCode < 300) {
       await fsp.mkdir(SENT_DIR, { recursive: true, mode: 0o700 });
       await fsp.rename(jobPath, path.join(SENT_DIR, path.basename(jobPath)));
-      logEvent("acode_transcript_sent", { statusCode: result.statusCode, sessionId: input.session_id || "" });
+      logEvent("acode_transcript_sent", { statusCode: result.statusCode, batchCount: batches.length, sessionId: input.session_id || "" });
     } else {
       logEvent("acode_transcript_failed", { statusCode: result.statusCode, error: result.error || "http error" });
     }
@@ -209,5 +251,5 @@ module.exports = {
   eventKind,
   enqueue,
   runWorker,
-  __test__: { resolveEndpoint, eventKind },
+  __test__: { resolveEndpoint, eventKind, splitOtlpLogs },
 };
