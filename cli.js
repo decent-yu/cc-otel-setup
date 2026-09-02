@@ -1181,6 +1181,63 @@ function stripAiOtelCodexHooks(text) {
   );
 }
 
+// ---------- AStudio / Acode hooks.json 处理 ----------
+
+function isManagedAcodeHookHandler(handler) {
+  const command = String(handler && handler.command ? handler.command : "");
+  return command.includes("ai-otel") && command.includes("on-session-start.js");
+}
+
+function mergeAcodeHookEvent(groups, managedGroup) {
+  const kept = (Array.isArray(groups) ? groups : []).map((group) => {
+    if (!group || typeof group !== "object") return group;
+    const hooks = Array.isArray(group.hooks)
+      ? group.hooks.filter((handler) => !isManagedAcodeHookHandler(handler))
+      : [];
+    return { ...group, hooks };
+  }).filter((group) => group && Array.isArray(group.hooks) && group.hooks.length > 0);
+  kept.push(managedGroup);
+  return kept;
+}
+
+function mergeAcodeHooks(existing, command) {
+  const merged = { ...existing, hooks: { ...(existing && existing.hooks ? existing.hooks : {}) } };
+  const managedGroup = { hooks: [{ type: "command", command }] };
+  merged.hooks.UserPromptSubmit = mergeAcodeHookEvent(merged.hooks.UserPromptSubmit, managedGroup);
+  merged.hooks.Stop = mergeAcodeHookEvent(merged.hooks.Stop, managedGroup);
+  return merged;
+}
+
+function installAcode(home, endpoint, otelTransport, gitUser) {
+  const acodeDir = path.join(home, ".acode");
+  if (!fs.existsSync(acodeDir)) {
+    return { tool: "acode", status: "skipped", reason: "未检测到 ~/.acode" };
+  }
+  const installDir = path.join(acodeDir, "ai-otel");
+  const hooksPath = path.join(acodeDir, "hooks.json");
+  const hookDest = path.join(installDir, "on-session-start.js");
+  const launcherDest = path.join(installDir, "launch-hook.js");
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "templates", "acode", "on-session-start.js"), hookDest);
+  fs.copyFileSync(path.join(__dirname, "templates", "acode", "transcript-parser.js"), path.join(installDir, "transcript-parser.js"));
+  fs.copyFileSync(path.join(__dirname, "templates", "acode", "logging.js"), path.join(installDir, "logging.js"));
+  const launcher = installLauncher(installDir);
+  const command = buildHookCommand(launcher, hookDest);
+  const endpointConfig = buildFullEndpointConfig(endpoint, otelTransport, {
+    serviceName: "acode",
+    toolKind: "acode",
+    headers: gitUser && gitUser.email
+      ? { "x-ai-otel-git-email": String(gitUser.email).trim().toLowerCase() }
+      : {},
+  });
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), endpointConfig);
+  const existing = readJSONSafe(hooksPath);
+  const bak = backup(hooksPath);
+  writeJSONAtomic(hooksPath, mergeAcodeHooks(existing, command));
+  writeInstallLog(installDir, "acode", endpoint, otelTransport);
+  return { tool: "acode", status: "installed", path: hooksPath, backup: bak };
+}
+
 function stripCodexOtel(text) {
   // 删除任意 [otel] 及其所有 [otel.*] 子表（不再只删带 enabled=true 的旧块）。
   // 我们每次都重写整个 otel 命名空间，先全清再写 → 永不出现重复 [otel]
@@ -1671,6 +1728,11 @@ async function main() {
   } catch (e) {
     results.push({ tool: "gemini", status: "failed", reason: e.message });
   }
+  try {
+    results.push(installAcode(home, endpoint, otelTransport, gitUser));
+  } catch (e) {
+    results.push({ tool: "acode", status: "failed", reason: e.message });
+  }
 
   const debug = !!args.debug || process.argv.includes("--debug") || process.argv.includes("-d");
   const allResults = [{ tool: "claude", status: "installed" }, ...results];
@@ -1765,4 +1827,6 @@ module.exports.__test__ = {
   buildCodexOtelHookBlock,
   stripAiOtelCodexHooks,
   installCodex,
+  installAcode,
+  mergeAcodeHooks,
 };
