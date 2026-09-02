@@ -79,6 +79,18 @@ npx -y ai-otel-setup usage-backfill
 | Codex CLI | `~/.codex/ai-otel/ai-otel.log` |
 | Gemini CLI | `~/.gemini/ai-otel/ai-otel.log` |
 
+## AStudio 支持
+
+如果本机存在 `~/.acode/`，安装器会额外配置 AStudio：
+
+- 在 `~/.acode/ai-otel/` 安装 AStudio transcript Hook；
+- 在 `~/.acode/hooks.json` 注册 `UserPromptSubmit` 和 `Stop` Hook；
+- 读取 `~/.acode/sessions/**/rollout-*.jsonl` 中当前 turn 的用户消息、模型回复、工具调用/结果和 token 用量；
+- 通过 OTLP/HTTP Logs `/v1/logs` 发送，数据标记为 `tool_kind=acode`、`data_source=acode_transcript_hook`；
+- Hook 只负责排队并立即返回，transcript 解析和网络发送在 detached worker 中完成。
+
+AStudio 使用与 Codex transcript 兼容的 JSONL 格式，但配置目录不同，因此不会复用或修改 `~/.codex/config.toml`。AStudio 的原始 Provider HTTP 请求体不在本功能范围内。
+
 ## 卸载
 
 还原安装前的备份即可：
