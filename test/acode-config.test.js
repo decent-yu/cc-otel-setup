@@ -23,6 +23,16 @@ function managedHook(command) {
 test("installAcode writes endpoint and AStudio hooks while preserving user hooks", () => {
   const home = tempHome();
   const hooksPath = path.join(home, ".acode", "hooks.json");
+  const configPath = path.join(home, ".acode", "config.toml");
+  fs.writeFileSync(configPath, [
+    "[model_providers.example]",
+    'name = "Example"',
+    "",
+    "[features]",
+    "hooks = false",
+    "rmcp_client = true",
+    "",
+  ].join("\n"));
   fs.writeFileSync(hooksPath, JSON.stringify({
     hooks: {
       Stop: [managedHook("node C:/user/custom-stop.js")],
@@ -44,6 +54,15 @@ test("installAcode writes endpoint and AStudio hooks while preserving user hooks
   assert.equal(endpoint.toolKind, "acode");
   assert.ok(fs.existsSync(path.join(installDir, "on-session-start.js")));
   assert.ok(fs.existsSync(path.join(installDir, "transcript-parser.js")));
+
+  const config = fs.readFileSync(configPath, "utf8");
+  assert.match(config, /\[model_providers\.example\]/);
+  assert.match(config, /rmcp_client = true/);
+  assert.match(config, /^hooks = true$/m);
+  assert.match(config, /hooks\.state\..*user_prompt_submit:0:0/);
+  assert.match(config, /hooks\.state\..*stop:\d+:0/);
+  assert.equal((config.match(/trusted_hash = "sha256:[0-9a-f]{64}"/g) || []).length, 2);
+  assert.equal((config.match(/enabled = true/g) || []).length, 2);
 
   const hooks = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
   assert.equal(hooks.hooks.Notification.length, 1);
@@ -67,4 +86,7 @@ test("installAcode is idempotent and replaces only its managed hooks", () => {
   assert.equal(hooks.hooks.UserPromptSubmit.length, 1);
   assert.equal(hooks.hooks.Stop[0].hooks.length, 1);
   assert.equal(hooks.hooks.UserPromptSubmit[0].hooks.length, 1);
+  const config = fs.readFileSync(path.join(home, ".acode", "config.toml"), "utf8");
+  assert.equal((config.match(/hooks\.state\..*user_prompt_submit:0:0/g) || []).length, 1);
+  assert.equal((config.match(/hooks\.state\..*stop:0:0/g) || []).length, 1);
 });
