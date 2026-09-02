@@ -1181,6 +1181,167 @@ function stripAiOtelCodexHooks(text) {
   );
 }
 
+// ---------- AStudio / Acode hooks.json 处理 ----------
+
+function isManagedAcodeHookHandler(handler) {
+  const command = String(handler && handler.command ? handler.command : "");
+  return command.includes("ai-otel") && command.includes("on-session-start.js");
+}
+
+function canonicalAcodeJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalAcodeJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalAcodeJson(value[key])]));
+}
+
+function acodeEventKey(eventName) {
+  return String(eventName || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase();
+}
+
+function acodeCommandHookTrustedHash(eventName, group, handler, platform = process.platform) {
+  const eventKey = acodeEventKey(eventName);
+  const command = platform === "win32" && typeof handler.commandWindows === "string"
+    ? handler.commandWindows
+    : handler.command;
+  const normalizedHandler = {
+    type: "command",
+    command,
+    timeout: Math.max(Number.isInteger(handler.timeout) ? handler.timeout : 600, 1),
+    async: handler.async === true,
+  };
+  const identity = {
+    event_name: eventKey,
+    hooks: [normalizedHandler],
+  };
+  if (typeof group.matcher === "string" && group.matcher.trim()) identity.matcher = group.matcher;
+  return `sha256:${crypto.createHash("sha256").update(JSON.stringify(canonicalAcodeJson(identity))).digest("hex")}`;
+}
+
+function acodeHookStateHeader(hooksPath, eventName, groupIndex, handlerIndex) {
+  const key = `${hooksPath}:${acodeEventKey(eventName)}:${groupIndex}:${handlerIndex}`;
+  const escaped = key.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+  return `[hooks.state."${escaped}"]`;
+}
+
+function removeTomlSectionsByHeader(text, headers) {
+  const lines = String(text || "").split(/\r?\n/);
+  const retained = [];
+  let removing = false;
+  for (const line of lines) {
+    if (/^\s*\[/.test(line)) removing = headers.has(line.trim());
+    if (!removing) retained.push(line);
+  }
+  return retained.join("\n").trimEnd();
+}
+
+function enableAcodeHooksFeature(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "[features]");
+  if (start < 0) {
+    const prefix = lines.join("\n").trimEnd();
+    return `${prefix ? `${prefix}\n\n` : ""}[features]\nhooks = true\n`;
+  }
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\s*\[/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  const hooksIndex = lines.findIndex((line, index) => index > start && index < end && /^\s*hooks\s*=/.test(line));
+  if (hooksIndex >= 0) lines[hooksIndex] = "hooks = true";
+  else lines.splice(start + 1, 0, "hooks = true");
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function mergeAcodeHookTrustConfig(existing, hooksPaths, hooksDocument) {
+  const managedHeaders = new Set();
+  const sections = [];
+  for (const hooksPath of hooksPaths) {
+    for (const eventName of ["UserPromptSubmit", "Stop"]) {
+      const groups = hooksDocument.hooks && hooksDocument.hooks[eventName];
+      if (!Array.isArray(groups)) continue;
+      groups.forEach((group, groupIndex) => {
+        const handlers = group && Array.isArray(group.hooks) ? group.hooks : [];
+        handlers.forEach((handler, handlerIndex) => {
+          if (!isManagedAcodeHookHandler(handler)) return;
+          const header = acodeHookStateHeader(hooksPath, eventName, groupIndex, handlerIndex);
+          managedHeaders.add(header);
+          sections.push([
+            header,
+            "enabled = true",
+            `trusted_hash = "${acodeCommandHookTrustedHash(eventName, group, handler)}"`,
+          ].join("\n"));
+        });
+      });
+    }
+  }
+  const retained = removeTomlSectionsByHeader(existing, managedHeaders);
+  const enabled = enableAcodeHooksFeature(retained).trimEnd();
+  return `${enabled}${sections.length ? `\n\n${sections.join("\n\n")}` : ""}\n`;
+}
+
+function mergeAcodeHookEvent(groups, managedGroup) {
+  const kept = (Array.isArray(groups) ? groups : []).map((group) => {
+    if (!group || typeof group !== "object") return group;
+    const hooks = Array.isArray(group.hooks)
+      ? group.hooks.filter((handler) => !isManagedAcodeHookHandler(handler))
+      : [];
+    return { ...group, hooks };
+  }).filter((group) => group && Array.isArray(group.hooks) && group.hooks.length > 0);
+  kept.push(managedGroup);
+  return kept;
+}
+
+function mergeAcodeHooks(existing, command) {
+  const merged = { ...existing, hooks: { ...(existing && existing.hooks ? existing.hooks : {}) } };
+  const managedGroup = { hooks: [{ type: "command", command, timeout: 3 }] };
+  merged.hooks.UserPromptSubmit = mergeAcodeHookEvent(merged.hooks.UserPromptSubmit, managedGroup);
+  merged.hooks.Stop = mergeAcodeHookEvent(merged.hooks.Stop, managedGroup);
+  return merged;
+}
+
+function installAcode(home, endpoint, otelTransport, gitUser) {
+  const acodeDir = path.join(home, ".acode");
+  if (!fs.existsSync(acodeDir)) {
+    return { tool: "acode", status: "skipped", reason: "未检测到 ~/.acode" };
+  }
+  const installDir = path.join(acodeDir, "ai-otel");
+  const hooksPath = path.join(acodeDir, "hooks.json");
+  const configPath = path.join(acodeDir, "config.toml");
+  const hookDest = path.join(installDir, "on-session-start.js");
+  const launcherDest = path.join(installDir, "launch-hook.js");
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "templates", "acode", "on-session-start.js"), hookDest);
+  fs.copyFileSync(path.join(__dirname, "templates", "acode", "transcript-parser.js"), path.join(installDir, "transcript-parser.js"));
+  fs.copyFileSync(path.join(__dirname, "templates", "acode", "logging.js"), path.join(installDir, "logging.js"));
+  const launcher = installLauncher(installDir);
+  const command = buildHookCommand(launcher, hookDest);
+  const endpointConfig = buildFullEndpointConfig(endpoint, otelTransport, {
+    serviceName: "acode",
+    toolKind: "acode",
+    headers: gitUser && gitUser.email
+      ? { "x-ai-otel-git-email": String(gitUser.email).trim().toLowerCase() }
+      : {},
+  });
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), endpointConfig);
+  const existing = readJSONSafe(hooksPath);
+  const mergedHooks = mergeAcodeHooks(existing, command);
+  const bak = backup(hooksPath);
+  const configBak = backup(configPath);
+  writeJSONAtomic(hooksPath, mergedHooks);
+  const existingConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const trustedHookPaths = [hooksPath];
+  const astudioOverlayDir = path.join(acodeDir, "acode", "acode-home-overlay");
+  if (fs.existsSync(astudioOverlayDir)) trustedHookPaths.push(path.join(astudioOverlayDir, "hooks.json"));
+  fs.writeFileSync(configPath, mergeAcodeHookTrustConfig(existingConfig, trustedHookPaths, mergedHooks), "utf8");
+  writeInstallLog(installDir, "acode", endpoint, otelTransport);
+  return { tool: "acode", status: "installed", path: hooksPath, backup: bak, configPath, configBackup: configBak };
+}
+
 function stripCodexOtel(text) {
   // 删除任意 [otel] 及其所有 [otel.*] 子表（不再只删带 enabled=true 的旧块）。
   // 我们每次都重写整个 otel 命名空间，先全清再写 → 永不出现重复 [otel]
@@ -1671,6 +1832,11 @@ async function main() {
   } catch (e) {
     results.push({ tool: "gemini", status: "failed", reason: e.message });
   }
+  try {
+    results.push(installAcode(home, endpoint, otelTransport, gitUser));
+  } catch (e) {
+    results.push({ tool: "acode", status: "failed", reason: e.message });
+  }
 
   const debug = !!args.debug || process.argv.includes("--debug") || process.argv.includes("-d");
   const allResults = [{ tool: "claude", status: "installed" }, ...results];
@@ -1765,4 +1931,6 @@ module.exports.__test__ = {
   buildCodexOtelHookBlock,
   stripAiOtelCodexHooks,
   installCodex,
+  installAcode,
+  mergeAcodeHooks,
 };
