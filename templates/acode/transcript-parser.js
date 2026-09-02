@@ -49,6 +49,20 @@ function timestampMs(value, fallback = Date.now()) {
   return Number.isFinite(result) ? result : fallback;
 }
 
+function normalizedTimestamp(value, fallback = null) {
+  if (value !== undefined && value !== null && value !== "") {
+    const numeric = typeof value === "number" ? value : /^\d+(?:\.\d+)?$/.test(String(value)) ? Number(value) : NaN;
+    if (Number.isFinite(numeric)) {
+      const milliseconds = numeric < 100000000000 ? numeric * 1000 : numeric;
+      const date = new Date(milliseconds);
+      if (Number.isFinite(date.getTime())) return date.toISOString();
+    }
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  }
+  return fallback;
+}
+
 function traceIdFor(sessionId, turnId) {
   return crypto.createHash("sha256").update(`acode:${sessionId || "session"}:${turnId || "turn"}`).digest("hex").slice(0, 32);
 }
@@ -123,6 +137,7 @@ function createTurn(id, startedAt) {
     llm_calls: [],
     raw_events: [],
     usage: null,
+    completion: null,
     _open_assistant_indexes: [],
     _pending_assistant_groups: [],
   };
@@ -231,13 +246,14 @@ function parseTranscript(input, hookInput = {}) {
     return current;
   }
 
-  function finishTurn(status, timestamp, lastMessage) {
+  function finishTurn(status, timestamp, lastMessage, completion) {
     if (!current) return;
     closeAssistantGroup(current);
     while (current._pending_assistant_groups.length > 0) finalizeLlmCall(current, null, timestamp);
     orderLlmCalls(current);
     current.status = status || current.status;
-    current.completed_at = timestamp || current.completed_at;
+    current.completion = completion || current.completion;
+    current.completed_at = normalizedTimestamp(completion?.completed_at, timestamp || current.completed_at);
     if (lastMessage && !current.messages.some((message) => message.content === lastMessage)) {
       current.messages.push({ role: "assistant", type: "message", content: lastMessage, timestamp });
     }
@@ -319,10 +335,10 @@ function parseTranscript(input, hookInput = {}) {
       continue;
     }
     if (eventType === "task_complete" || eventType === "turn_complete") {
-      finishTurn("completed", timestamp, payload.last_agent_message);
+      finishTurn("completed", timestamp, payload.last_agent_message, payload);
       continue;
     }
-    if (eventType === "turn_aborted") finishTurn("aborted", timestamp, null);
+    if (eventType === "turn_aborted") finishTurn("aborted", timestamp, null, payload);
   }
   if (current) {
     closeAssistantGroup(current);
@@ -407,6 +423,9 @@ function buildOtlpLogs(parsed, options = {}) {
       "capture.fidelity": "transcript_reconstructed",
       "turn.llm_call_count": llmCalls.length,
       "turn.tool_call_count": turn.tool_calls.length,
+      "turn.completed_at": turn.completed_at,
+      "turn.duration_ms": turn.completion?.duration_ms,
+      "turn.time_to_first_token_ms": turn.completion?.time_to_first_token_ms,
       "acode.raw.session_meta": session.raw_meta,
       "acode.raw.turn.events": turn.raw_events,
       "gen_ai.usage.input_tokens": turn.usage?.input_tokens,

@@ -2,6 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const {
   parseTranscript,
@@ -262,4 +265,54 @@ test("splits lossless OTLP records into bounded HTTP batches", () => {
   assert.ok(batches.length > 1);
   assert.deepEqual(restored, original);
   assert.ok(batches.every((batch) => Buffer.byteLength(JSON.stringify(batch)) <= 6000));
+});
+
+test("waits for task_complete before capturing final turn metadata", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-otel-acode-stable-"));
+  const transcript = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(transcript, [
+    line("2026-09-02T03:00:00.000Z", "event_msg", { type: "task_started", turn_id: "turn-stable" }),
+    line("2026-09-02T03:00:01.000Z", "response_item", {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "done" }],
+    }),
+  ].join("\n") + "\n");
+
+  setTimeout(() => fs.appendFileSync(transcript, line("2026-09-02T03:00:02.000Z", "event_msg", {
+    type: "task_complete",
+    turn_id: "turn-stable",
+    completed_at: 1788330802,
+    duration_ms: 2000,
+    time_to_first_token_ms: 250,
+  }) + "\n"), 40);
+
+  const stable = await hookTest.readStableTranscript(transcript, "turn-stable", {
+    timeoutMs: 1000,
+    intervalMs: 10,
+  });
+  const parsed = parseTranscript(stable, { session_id: "session-stable", turn_id: "turn-stable" });
+  const payload = buildOtlpLogs(parsed, { serviceName: "acode", serviceVersion: "test" });
+  const root = payload.resourceLogs[0].scopeLogs[0].logRecords.find((record) => record.body.stringValue === "agent.turn");
+  const attrs = Object.fromEntries(root.attributes.map((entry) => [entry.key, entry.value.stringValue]));
+  const rawEvents = JSON.parse(attrs["acode.raw.turn.events"]);
+
+  assert.equal(rawEvents.at(-1).payload.type, "task_complete");
+  assert.equal(attrs["turn.completed_at"], new Date(1788330802 * 1000).toISOString());
+  assert.equal(attrs["turn.duration_ms"], "2000");
+  assert.equal(attrs["turn.time_to_first_token_ms"], "250");
+});
+
+test("does not return an incomplete transcript after stabilization timeout", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-otel-acode-incomplete-"));
+  const transcript = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(transcript, line("2026-09-02T03:00:00.000Z", "event_msg", {
+    type: "task_started",
+    turn_id: "turn-incomplete",
+  }) + "\n");
+
+  await assert.rejects(
+    hookTest.readStableTranscript(transcript, "turn-incomplete", { timeoutMs: 30, intervalMs: 5 }),
+    (error) => error && error.code === "ACODE_TRANSCRIPT_INCOMPLETE",
+  );
 });

@@ -18,6 +18,8 @@ const SENT_DIR = path.join(INSTALL_DIR, "sent");
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MAX_JOB_FILES = 10;
 const DEFAULT_MAX_BATCH_BYTES = 1500000;
+const DEFAULT_STABILIZE_TIMEOUT_MS = 2000;
+const DEFAULT_STABILIZE_INTERVAL_MS = 50;
 
 function configPath() {
   return path.join(INSTALL_DIR, "endpoint.json");
@@ -77,6 +79,43 @@ function parseHeaders(value) {
     if (key && headerValue) result[key] = headerValue;
   }
   return result;
+}
+
+function transcriptHasCompletion(text, turnId) {
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    if (!rawLine.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(rawLine);
+    } catch (_) {
+      continue;
+    }
+    const payload = record && record.type === "event_msg" ? record.payload : null;
+    if (!payload || !["task_complete", "turn_complete", "turn_aborted"].includes(payload.type)) continue;
+    if (!turnId || !payload.turn_id || payload.turn_id === turnId) return true;
+  }
+  return false;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readStableTranscript(filePath, turnId, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : DEFAULT_STABILIZE_TIMEOUT_MS;
+  const intervalMs = Math.max(1, Number.isFinite(options.intervalMs) ? options.intervalMs : DEFAULT_STABILIZE_INTERVAL_MS);
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let latest = "";
+  do {
+    latest = await fsp.readFile(filePath, "utf8");
+    if (transcriptHasCompletion(latest, turnId)) return latest;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await delay(Math.min(intervalMs, remaining));
+  } while (Date.now() <= deadline);
+  const error = new Error(`AStudio transcript did not complete turn ${turnId || "(unknown)"} within ${timeoutMs}ms`);
+  error.code = "ACODE_TRANSCRIPT_INCOMPLETE";
+  throw error;
 }
 
 function payloadWithRecords(payload, records) {
@@ -180,7 +219,10 @@ async function processJob(jobPath) {
     return;
   }
   try {
-    const transcript = await fsp.readFile(input.transcript_path, "utf8");
+    const transcript = await readStableTranscript(input.transcript_path, input.turn_id, {
+      timeoutMs: Number(process.env.ACODE_TRANSCRIPT_STABILIZE_TIMEOUT_MS) || DEFAULT_STABILIZE_TIMEOUT_MS,
+      intervalMs: Number(process.env.ACODE_TRANSCRIPT_STABILIZE_INTERVAL_MS) || DEFAULT_STABILIZE_INTERVAL_MS,
+    });
     const parsed = parseTranscript(transcript, input);
     const payload = buildOtlpLogs(parsed, {
       serviceName: "acode",
@@ -201,7 +243,10 @@ async function processJob(jobPath) {
       logEvent("acode_transcript_failed", { statusCode: result.statusCode, error: result.error || "http error" });
     }
   } catch (error) {
-    logEvent("acode_transcript_error", { error: error.message });
+    logEvent(error.code === "ACODE_TRANSCRIPT_INCOMPLETE" ? "acode_transcript_incomplete" : "acode_transcript_error", {
+      error: error.message,
+      turnId: input.turn_id || "",
+    });
   }
 }
 
@@ -251,5 +296,5 @@ module.exports = {
   eventKind,
   enqueue,
   runWorker,
-  __test__: { resolveEndpoint, eventKind, splitOtlpLogs },
+  __test__: { resolveEndpoint, eventKind, splitOtlpLogs, transcriptHasCompletion, readStableTranscript },
 };
