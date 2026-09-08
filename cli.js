@@ -1304,7 +1304,7 @@ function mergeAcodeHooks(existing, command) {
   return merged;
 }
 
-function installAcode(home, endpoint, otelTransport, gitUser) {
+function installAcode(home, endpoint, otelTransport, gitUser, snapshotConfig = {}) {
   const acodeDir = path.join(home, ".acode");
   if (!fs.existsSync(acodeDir)) {
     return { tool: "acode", status: "skipped", reason: "未检测到 ~/.acode" };
@@ -1318,6 +1318,9 @@ function installAcode(home, endpoint, otelTransport, gitUser) {
   fs.copyFileSync(path.join(__dirname, "templates", "acode", "on-session-start.js"), hookDest);
   fs.copyFileSync(path.join(__dirname, "templates", "acode", "transcript-parser.js"), path.join(installDir, "transcript-parser.js"));
   fs.copyFileSync(path.join(__dirname, "templates", "acode", "logging.js"), path.join(installDir, "logging.js"));
+  const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
+  fs.copyFileSync(path.join(__dirname, "templates", "git-snapshot.js"), gitSnapshotDest);
+  fs.chmodSync(gitSnapshotDest, 0o755);
   const launcher = installLauncher(installDir);
   const command = buildHookCommand(launcher, hookDest);
   const endpointConfig = buildFullEndpointConfig(endpoint, otelTransport, {
@@ -1326,6 +1329,12 @@ function installAcode(home, endpoint, otelTransport, gitUser) {
     headers: gitUser && gitUser.email
       ? { "x-ai-otel-git-email": String(gitUser.email).trim().toLowerCase() }
       : {},
+    machineId: snapshotConfig.machineId || getOrCreateMachineId(installDir),
+    fullUpload: snapshotConfig.fullUpload === true,
+    rawBodiesDir: snapshotConfig.rawBodiesDir || "",
+    gitSnapshotMaxFiles: snapshotConfig.gitSnapshotMaxFiles || 20,
+    gitSnapshotMaxBytes: snapshotConfig.gitSnapshotMaxBytes || 1 * 1024 * 1024,
+    gitSnapshotPerFileBytes: snapshotConfig.gitSnapshotPerFileBytes || 256 * 1024,
   });
   writeJSONAtomic(path.join(installDir, "endpoint.json"), endpointConfig);
   const existing = readJSONSafe(hooksPath);
@@ -1833,7 +1842,14 @@ async function main() {
     results.push({ tool: "gemini", status: "failed", reason: e.message });
   }
   try {
-    results.push(installAcode(home, endpoint, otelTransport, gitUser));
+    results.push(installAcode(home, endpoint, otelTransport, gitUser, {
+      machineId,
+      fullUpload,
+      rawBodiesDir,
+      gitSnapshotMaxFiles: 20,
+      gitSnapshotMaxBytes: 1 * 1024 * 1024,
+      gitSnapshotPerFileBytes: 256 * 1024,
+    }));
   } catch (e) {
     results.push({ tool: "acode", status: "failed", reason: e.message });
   }

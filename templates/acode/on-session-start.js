@@ -14,12 +14,17 @@ const { logEvent } = require("./logging");
 
 const INSTALL_DIR = __dirname;
 const PENDING_DIR = path.join(INSTALL_DIR, "pending");
+const PROCESSING_DIR = path.join(INSTALL_DIR, "processing");
 const SENT_DIR = path.join(INSTALL_DIR, "sent");
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MAX_JOB_FILES = 10;
 const DEFAULT_MAX_BATCH_BYTES = 1500000;
 const DEFAULT_STABILIZE_TIMEOUT_MS = 2000;
 const DEFAULT_STABILIZE_INTERVAL_MS = 50;
+const DEFAULT_WORKER_MAX_RUNTIME_MS = 25 * 1000;
+const PROCESSING_STALE_MS = 5 * 60 * 1000;
+const SENT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const RETRY_BACKOFF_MS = [5000, 30000, 2 * 60 * 1000, 10 * 60 * 1000, 60 * 60 * 1000];
 
 function configPath() {
   return path.join(INSTALL_DIR, "endpoint.json");
@@ -82,6 +87,7 @@ function parseHeaders(value) {
 }
 
 function transcriptHasCompletion(text, turnId) {
+  let requestedTurnStarted = !turnId;
   for (const rawLine of String(text || "").split(/\r?\n/)) {
     if (!rawLine.trim()) continue;
     let record;
@@ -91,8 +97,11 @@ function transcriptHasCompletion(text, turnId) {
       continue;
     }
     const payload = record && record.type === "event_msg" ? record.payload : null;
+    if (payload && ["task_started", "turn_started"].includes(payload.type) && payload.turn_id === turnId) {
+      requestedTurnStarted = true;
+    }
     if (!payload || !["task_complete", "turn_complete", "turn_aborted"].includes(payload.type)) continue;
-    if (!turnId || !payload.turn_id || payload.turn_id === turnId) return true;
+    if (!turnId || payload.turn_id === turnId || (!payload.turn_id && requestedTurnStarted)) return true;
   }
   return false;
 }
@@ -195,6 +204,42 @@ async function enqueue(input) {
   return jobPath;
 }
 
+function snapshotArgs(input = {}, config = {}) {
+  if (config.fullUpload !== true) return [];
+  const conversation = input.conversation || {};
+  const sessionId = conversation.id || input.conversation_id || input.session_id || "";
+  if (!sessionId) return [];
+  const kind = eventKind(input);
+  const turnId = input.turn_id || "";
+  const args = [
+    path.join(INSTALL_DIR, "git-snapshot.js"),
+    `--session-id=${sessionId}`,
+    `--hook-kind=${kind === "stop" ? "session_end" : "session_start"}`,
+    `--event-kind=${kind}`,
+    "--tool-kind=acode",
+    `--cwd=${input.cwd || process.cwd()}`,
+  ];
+  if (turnId) args.push(`--prompt-id=${turnId}`, `--turn-id=${turnId}`);
+  return args;
+}
+
+function spawnGitSnapshot(input, config) {
+  const args = snapshotArgs(input, config);
+  if (args.length === 0 || !fs.existsSync(args[0])) return false;
+  try {
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    return true;
+  } catch (error) {
+    logEvent("acode_git_snapshot_spawn_failed", { error: error.message });
+    return false;
+  }
+}
+
 async function spawnWorker() {
   const child = spawn(process.execPath, [__filename, "--worker"], {
     detached: true,
@@ -204,18 +249,41 @@ async function spawnWorker() {
   child.unref();
 }
 
+async function moveJob(jobPath, directory) {
+  await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+  await fsp.rename(jobPath, path.join(directory, path.basename(jobPath)));
+}
+
+function retryDelay(attempts) {
+  return RETRY_BACKOFF_MS[Math.min(Math.max(attempts - 1, 0), RETRY_BACKOFF_MS.length - 1)];
+}
+
+async function requeueJob(jobPath, input, error) {
+  const attempts = Number(input._attempts || 0) + 1;
+  const nextAttemptAt = Date.now() + retryDelay(attempts);
+  const updated = {
+    ...input,
+    _attempts: attempts,
+    _next_attempt_at: nextAttemptAt,
+    _last_error: String(error && error.message ? error.message : error || "unknown").slice(0, 500),
+  };
+  await fsp.writeFile(jobPath, `${JSON.stringify(updated)}\n`, { encoding: "utf8", mode: 0o600 });
+  await moveJob(jobPath, PENDING_DIR);
+  return nextAttemptAt;
+}
+
 async function processJob(jobPath) {
   let input;
   try {
     input = JSON.parse(await fsp.readFile(jobPath, "utf8"));
   } catch (error) {
     logEvent("acode_job_invalid", { error: error.message });
-    await fsp.rename(jobPath, path.join(SENT_DIR, path.basename(jobPath))).catch(() => undefined);
+    await moveJob(jobPath, SENT_DIR).catch(() => undefined);
     return;
   }
   if (!input.transcript_path) {
     logEvent("acode_job_skip", { reason: "missing_transcript_path" });
-    await fsp.rename(jobPath, path.join(SENT_DIR, path.basename(jobPath))).catch(() => undefined);
+    await moveJob(jobPath, SENT_DIR).catch(() => undefined);
     return;
   }
   try {
@@ -227,6 +295,7 @@ async function processJob(jobPath) {
     const payload = buildOtlpLogs(parsed, {
       serviceName: "acode",
       serviceVersion: readConfig().installerVersion || "unknown",
+      machineId: readConfig().machineId || "",
     });
     const config = readConfig();
     const batches = splitOtlpLogs(payload, Number(config.maxBatchBytes) || DEFAULT_MAX_BATCH_BYTES);
@@ -236,28 +305,108 @@ async function processJob(jobPath) {
       if (result.statusCode < 200 || result.statusCode >= 300) break;
     }
     if (result.statusCode >= 200 && result.statusCode < 300) {
-      await fsp.mkdir(SENT_DIR, { recursive: true, mode: 0o700 });
-      await fsp.rename(jobPath, path.join(SENT_DIR, path.basename(jobPath)));
+      await moveJob(jobPath, SENT_DIR);
       logEvent("acode_transcript_sent", { statusCode: result.statusCode, batchCount: batches.length, sessionId: input.session_id || "" });
     } else {
       logEvent("acode_transcript_failed", { statusCode: result.statusCode, error: result.error || "http error" });
+      await requeueJob(jobPath, input, new Error(result.error || `HTTP ${result.statusCode}`));
     }
   } catch (error) {
     logEvent(error.code === "ACODE_TRANSCRIPT_INCOMPLETE" ? "acode_transcript_incomplete" : "acode_transcript_error", {
       error: error.message,
       turnId: input.turn_id || "",
     });
+    await requeueJob(jobPath, input, error).catch((requeueError) => {
+      logEvent("acode_job_requeue_failed", { error: requeueError.message });
+    });
+  }
+}
+
+async function recoverProcessingJobs(now = Date.now()) {
+  let names = [];
+  try { names = await fsp.readdir(PROCESSING_DIR); } catch (_) { return; }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const jobPath = path.join(PROCESSING_DIR, name);
+    try {
+      const stat = await fsp.stat(jobPath);
+      if (now - stat.mtimeMs >= PROCESSING_STALE_MS) await moveJob(jobPath, PENDING_DIR);
+    } catch (_) {}
+  }
+}
+
+async function cleanupSentJobs(now = Date.now()) {
+  let names = [];
+  try { names = await fsp.readdir(SENT_DIR); } catch (_) { return; }
+  for (const name of names) {
+    const jobPath = path.join(SENT_DIR, name);
+    try {
+      const stat = await fsp.stat(jobPath);
+      if (now - stat.mtimeMs >= SENT_RETENTION_MS) await fsp.unlink(jobPath);
+    } catch (_) {}
+  }
+}
+
+async function claimJob(name, now = Date.now()) {
+  const pendingPath = path.join(PENDING_DIR, name);
+  let input;
+  try {
+    input = JSON.parse(await fsp.readFile(pendingPath, "utf8"));
+  } catch (_) {
+    input = {};
+  }
+  if (Number(input._next_attempt_at || 0) > now) return "";
+  await fsp.mkdir(PROCESSING_DIR, { recursive: true, mode: 0o700 });
+  const processingPath = path.join(PROCESSING_DIR, name);
+  try {
+    await fsp.rename(pendingPath, processingPath);
+    const claimedAt = new Date();
+    await fsp.utimes(processingPath, claimedAt, claimedAt);
+    return processingPath;
+  } catch (error) {
+    if (error.code === "ENOENT") return "";
+    throw error;
   }
 }
 
 async function runWorker() {
-  let names;
-  try {
-    names = (await fsp.readdir(PENDING_DIR)).filter((name) => name.endsWith(".json")).sort().slice(0, MAX_JOB_FILES);
-  } catch (_) {
-    return;
+  const config = readConfig();
+  if (config.fullUpload !== true) return;
+  await recoverProcessingJobs();
+  await cleanupSentJobs();
+  const maxRuntimeMs = Number(config.workerMaxRuntimeMs) || DEFAULT_WORKER_MAX_RUNTIME_MS;
+  const deadline = Date.now() + maxRuntimeMs;
+  let processed = 0;
+  while (processed < MAX_JOB_FILES && Date.now() < deadline) {
+    let names = [];
+    try { names = (await fsp.readdir(PENDING_DIR)).filter((name) => name.endsWith(".json")).sort(); }
+    catch (_) { return; }
+    let claimed = false;
+    let earliestRetryAt = Infinity;
+    for (const name of names) {
+      try {
+        const pending = JSON.parse(await fsp.readFile(path.join(PENDING_DIR, name), "utf8"));
+        const retryAt = Number(pending._next_attempt_at || 0);
+        if (retryAt > Date.now()) {
+          earliestRetryAt = Math.min(earliestRetryAt, retryAt);
+          continue;
+        }
+      } catch (_) {
+        // Invalid jobs are claimed and quarantined by processJob.
+      }
+      const jobPath = await claimJob(name);
+      if (!jobPath) continue;
+      claimed = true;
+      processed += 1;
+      await processJob(jobPath);
+      break;
+    }
+    if (claimed) continue;
+    if (!Number.isFinite(earliestRetryAt)) break;
+    const waitMs = Math.max(1, earliestRetryAt - Date.now());
+    if (Date.now() + waitMs > deadline) break;
+    await delay(waitMs);
   }
-  for (const name of names) await processJob(path.join(PENDING_DIR, name));
 }
 
 async function main() {
@@ -273,8 +422,15 @@ async function main() {
     logEvent("acode_hook_invalid_input");
   }
   const kind = eventKind(input);
-  // UserPromptSubmit is registered for lifecycle coverage; only Stop queues a
-  // completed transcript so a prompt cannot upload a partial duplicate turn.
+  const config = readConfig();
+  if (config.fullUpload !== true) {
+    process.stdout.write("{}\n");
+    return;
+  }
+  if (kind === "user_prompt" || kind === "stop" || kind === "session_start") {
+    spawnGitSnapshot(input, config);
+  }
+  // Only Stop queues a completed transcript so a prompt cannot upload a partial duplicate turn.
   if (kind === "stop") {
     try {
       await enqueue(input);
@@ -296,5 +452,14 @@ module.exports = {
   eventKind,
   enqueue,
   runWorker,
-  __test__: { resolveEndpoint, eventKind, splitOtlpLogs, transcriptHasCompletion, readStableTranscript },
+  __test__: {
+    resolveEndpoint,
+    eventKind,
+    splitOtlpLogs,
+    transcriptHasCompletion,
+    readStableTranscript,
+    snapshotArgs,
+    retryDelay,
+    claimJob,
+  },
 };

@@ -20,7 +20,7 @@
  *   - 三轴截断：max files / max bytes / per-file bytes
  *
  * argv：--session-id=<sid> --hook-kind=<session_start|session_end> \
- *       --event-kind=<session_start|user_prompt|stop> --tool-kind=<cc|codex> \
+ *       --event-kind=<session_start|user_prompt|stop> --tool-kind=<cc|codex|acode> \
  *       --prompt-id=<prompt_or_turn_id> --turn-id=<codex_turn_id> --cwd=<workspace>
  *   hook_kind 是旧字段（保留给后端兼容），event_kind 是新字段（细粒度区分）
  */
@@ -339,7 +339,9 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
     const promptUuid = args["prompt-id"] || "";            // CC 原生 prompt.id（从 transcript 反查）
     const turnId = args["turn-id"] || "";                  // Codex 原生 turn_id
     const requestedToolKind = String(args["tool-kind"] || "cc").toLowerCase();
-    const toolKind = requestedToolKind === "codex" ? "codex" : "cc";
+    const toolKind = requestedToolKind === "codex" || requestedToolKind === "acode"
+      ? requestedToolKind
+      : "cc";
     const cwd = args["cwd"] || process.cwd();
     const cfg = readJSONSafe(path.join(__dirname, "endpoint.json"));
 

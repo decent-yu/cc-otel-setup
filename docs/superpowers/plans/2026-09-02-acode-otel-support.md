@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extend `ai-otel-setup` with an AStudio integration that reads `~/.acode` rollout transcripts and exports structured model/tool interaction data to the existing OTLP Logs endpoint.
+**Goal:** Extend `ai-otel-setup` with an AStudio integration that archives `~/.acode` rollout records and workspace snapshots through the existing CC full-data OSS infrastructure.
 
-**Architecture:** Add a pure AStudio transcript parser/OTLP envelope builder under `templates/acode`, and a small command-hook runner that queues completed turns in a detached worker. Extend `cli.js` with idempotent `~/.acode/hooks.json` installation and endpoint configuration. Keep the existing Claude/Codex/Gemini paths unchanged.
+**Architecture:** Add a pure AStudio transcript parser/OTLP envelope builder under `templates/acode`, and a command-hook runner that safely queues completed turns and dispatches the shared snapshot engine. Extend `cli.js` with idempotent `~/.acode/hooks.json` installation and full-upload configuration. Route Acode records through the Collector full pipeline and Forwarder WAL into `acode_records`; route uploaded Acode files into `acode_snapshot_files` or `acode_body_files`.
 
 **Tech Stack:** Node.js CommonJS scripts, Node built-ins (`fs`, `crypto`, `http`, `https`), JSONL transcript parsing, OTLP/HTTP JSON logs, Node built-in test runner.
 
@@ -79,7 +79,7 @@ Expected: FAIL for the missing hook runtime.
 
 - [ ] **Step 3: Implement the hook**
 
-Read AStudio hook JSON from stdin. For `UserPromptSubmit` and `Stop`, enqueue a small JSON job under the installed Acode OTLP directory and return `{}` immediately. A detached `--worker` process reads pending jobs, parses the transcript, posts JSON OTLP Logs to `/v1/logs`, and retains failed jobs for a later hook invocation. Use `endpoint.json`, optional `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, and optional configured headers; never copy provider credentials automatically.
+Read AStudio hook JSON from stdin. Under `fullUpload=true`, `UserPromptSubmit` dispatches the shared snapshot engine and `Stop` dispatches a snapshot plus a small transcript job. A detached `--worker` process atomically claims pending jobs, parses the transcript, posts JSON OTLP Logs to `/v1/logs`, and returns failed jobs with retry metadata. Use `endpoint.json`, optional `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, and optional configured headers; never copy provider credentials automatically.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -115,7 +115,7 @@ Expected: FAIL because `installAcode` is not defined/exported.
 
 - [ ] **Step 3: Implement `installAcode`**
 
-Use the existing endpoint normalization helpers and hook command builder. Put AStudio files under `home/.acode/ai-otel`, use the Acode nested hook schema (`hooks.Event = [{ hooks: [{ type: "command", command }] }]`), and merge only the installer-managed command signatures. Add the result to the installation summary. Keep raw-body uploader and Codex paths separate.
+Use the existing endpoint normalization helpers and hook command builder. Put AStudio files under `home/.acode/ai-otel`, copy the shared `git-snapshot.js`, write `fullUpload`, `machineId`, `rawBodiesDir` and snapshot limits to `endpoint.json`, use the Acode nested hook schema (`hooks.Event = [{ hooks: [{ type: "command", command }] }]`), and merge only installer-managed command signatures. Add the result to the installation summary. Reuse the existing Claude raw-body uploader/timer instead of installing another uploader.
 
 - [ ] **Step 4: Call the installer from `main()`** when `~/.acode` exists, catching failures in the same way as the existing optional tool installers.
 
@@ -132,6 +132,15 @@ git commit -m "feat: install AStudio OTLP hooks"
 ```
 
 ### Task 5: Run regression tests and static checks
+
+Before final verification, update the server repository:
+
+- allow `tool_kind=acode` with `agent.turn`, `llm.request`, `tool.call` and `hook_git_snapshot` only in Collector `logs/full_mongo`;
+- preserve Acode identity in shared normalization;
+- route Acode WAL files to `acode_records`;
+- route Acode snapshot/body uploads to `acode_snapshot_files` / `acode_body_files`;
+- update both the Helm-mounted K8s Collector config and the production deployment config mirror;
+- add focused Collector, OSS archive and raw upload tests.
 
 **Files:**
 - Test: `test/*.js`

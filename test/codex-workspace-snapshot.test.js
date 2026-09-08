@@ -19,6 +19,8 @@ function git(cwd, args, env = process.env) {
 
 test("raw uploader identifies Codex snapshot bundles without changing CC defaults", () => {
   assert.equal(uploaderTest.fileToolKind("snapshot-codex-session-1-stop.snapshot.bundle"), "codex");
+  assert.equal(uploaderTest.fileToolKind("snapshot-acode-session-1-stop.snapshot.bundle"), "acode");
+  assert.equal(uploaderTest.fileToolKind("acode-session-1.request.json"), "acode");
   assert.equal(uploaderTest.fileToolKind("snapshot-session-1-stop.snapshot.bundle"), "cc");
   assert.equal(uploaderTest.fileToolKind("abc.request.json"), "cc");
 });
@@ -80,4 +82,47 @@ test("Codex git snapshot creates a codex bundle and hidden ref", () => {
   assert.match(bundles[0], /^snapshot-codex-codex-session-test-\d+-user_prompt\.snapshot\.bundle$/);
   const refs = git(repo, ["for-each-ref", "--format=%(refname)", "refs/snapshots/codex-session-test/"]);
   assert.match(refs, /-user_prompt$/);
+});
+
+test("Acode git snapshot creates an acode bundle and hidden ref", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-otel-acode-snapshot-"));
+  const repo = path.join(tmp, "repo");
+  const install = path.join(tmp, "install");
+  const rawBodiesDir = path.join(tmp, "raw-bodies");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(install, { recursive: true });
+  fs.copyFileSync(path.resolve(__dirname, "../templates/git-snapshot.js"), path.join(install, "git-snapshot.js"));
+  fs.writeFileSync(path.join(install, "endpoint.json"), JSON.stringify({
+    endpoint: "http://127.0.0.1:1",
+    fullUpload: true,
+    rawBodiesDir,
+  }));
+
+  git(repo, ["init"]);
+  git(repo, ["config", "user.email", "snapshot-test@example.invalid"]);
+  git(repo, ["config", "user.name", "Snapshot Test"]);
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "before\n");
+  git(repo, ["add", "tracked.txt"]);
+  git(repo, ["commit", "-m", "baseline"]);
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "after\n");
+
+  const result = spawnSync(process.execPath, [path.join(install, "git-snapshot.js"),
+    "--session-id=acode-session-test",
+    "--hook-kind=session_end",
+    "--event-kind=stop",
+    "--tool-kind=acode",
+    "--prompt-id=turn-1",
+    "--turn-id=turn-1",
+    `--cwd=${repo}`,
+  ], {
+    encoding: "utf8",
+    timeout: 20000,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const bundles = fs.readdirSync(rawBodiesDir);
+  assert.equal(bundles.length, 1);
+  assert.match(bundles[0], /^snapshot-acode-acode-session-test-\d+-stop\.snapshot\.bundle$/);
+  const refs = git(repo, ["for-each-ref", "--format=%(refname)", "refs/snapshots/acode-session-test/"]);
+  assert.match(refs, /-stop$/);
 });

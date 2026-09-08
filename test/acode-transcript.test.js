@@ -138,8 +138,8 @@ test("selects the requested turn and falls back to the final turn", () => {
 
 test("builds deterministic OTLP Logs with Acode identity and GenAI fields", () => {
   const parsed = parseTranscript(fixture(), { session_id: "session-1", turn_id: "turn-1" });
-  const first = buildOtlpLogs(parsed, { serviceName: "acode", serviceVersion: "test" });
-  const second = buildOtlpLogs(parsed, { serviceName: "acode", serviceVersion: "test" });
+  const first = buildOtlpLogs(parsed, { serviceName: "acode", serviceVersion: "test", machineId: "machine-1" });
+  const second = buildOtlpLogs(parsed, { serviceName: "acode", serviceVersion: "test", machineId: "machine-1" });
 
   assert.deepEqual(first, second);
   assert.equal(first.resourceLogs[0].resource.attributes.find((x) => x.key === "service.name").value.stringValue, "acode");
@@ -151,6 +151,7 @@ test("builds deterministic OTLP Logs with Acode identity and GenAI fields", () =
   const attrs = Object.fromEntries(llm.attributes.map((x) => [x.key, x.value.stringValue]));
   assert.equal(attrs["gen_ai.request.model"], "spark-x2.5-harness");
   assert.equal(attrs["gen_ai.provider.name"], "astron-spark");
+  assert.equal(attrs["ai_otel.machine_id"], "machine-1");
   assert.equal(attrs["gen_ai.usage.input_tokens"], "100");
   assert.match(attrs["gen_ai.input.messages"], /Inspect this project/);
   assert.match(attrs["gen_ai.output.messages"], /I found the file/);
@@ -253,6 +254,12 @@ test("AStudio hook resolves an explicit logs endpoint and classifies lifecycle e
   assert.equal(hookTest.resolveEndpoint({ endpoint: "https://collector.example.invalid:24317" }), "https://collector.example.invalid:24317/v1/logs");
   assert.equal(hookTest.eventKind({ hook_event_name: "Stop" }), "stop");
   assert.equal(hookTest.eventKind({ hook_event_name: "UserPromptSubmit" }), "user_prompt");
+  assert.deepEqual(hookTest.snapshotArgs({ hook_event_name: "Stop", session_id: "s1", turn_id: "t1", cwd: "/tmp/work" }, { fullUpload: false }), []);
+  const args = hookTest.snapshotArgs({ hook_event_name: "Stop", session_id: "s1", turn_id: "t1", cwd: "/tmp/work" }, { fullUpload: true });
+  assert.ok(args[0].endsWith("git-snapshot.js"));
+  assert.ok(args.includes("--tool-kind=acode"));
+  assert.ok(args.includes("--event-kind=stop"));
+  assert.ok(args.includes("--turn-id=t1"));
 });
 
 test("splits lossless OTLP records into bounded HTTP batches", () => {
@@ -315,4 +322,33 @@ test("does not return an incomplete transcript after stabilization timeout", asy
     hookTest.readStableTranscript(transcript, "turn-incomplete", { timeoutMs: 30, intervalMs: 5 }),
     (error) => error && error.code === "ACODE_TRANSCRIPT_INCOMPLETE",
   );
+});
+
+test("completion detection ignores an older id-less completion before the requested turn", () => {
+  const text = [
+    line("2026-09-02T03:00:00.000Z", "event_msg", { type: "task_complete" }),
+    line("2026-09-02T03:00:01.000Z", "event_msg", { type: "task_started", turn_id: "turn-current" }),
+  ].join("\n");
+  assert.equal(hookTest.transcriptHasCompletion(text, "turn-current"), false);
+  assert.equal(hookTest.transcriptHasCompletion(`${text}\n${line("2026-09-02T03:00:02.000Z", "event_msg", { type: "task_complete" })}`, "turn-current"), true);
+});
+
+test("failed AStudio jobs use bounded retry backoff", () => {
+  assert.equal(hookTest.retryDelay(1), 5000);
+  assert.equal(hookTest.retryDelay(99), 60 * 60 * 1000);
+});
+
+test("concurrent AStudio workers can claim a pending turn only once", async () => {
+  const install = fs.mkdtempSync(path.join(os.tmpdir(), "ai-otel-acode-queue-"));
+  for (const name of ["on-session-start.js", "transcript-parser.js", "logging.js"]) {
+    fs.copyFileSync(path.resolve(__dirname, `../templates/acode/${name}`), path.join(install, name));
+  }
+  const isolatedHook = require(path.join(install, "on-session-start.js"));
+  const jobPath = await isolatedHook.enqueue({ session_id: "s1", turn_id: "t1" });
+  const name = path.basename(jobPath);
+  const claims = await Promise.all([
+    isolatedHook.__test__.claimJob(name),
+    isolatedHook.__test__.claimJob(name),
+  ]);
+  assert.equal(claims.filter(Boolean).length, 1);
 });

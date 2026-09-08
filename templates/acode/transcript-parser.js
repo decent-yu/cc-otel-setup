@@ -391,6 +391,7 @@ function buildOtlpLogs(parsed, options = {}) {
   const common = {
     tool_kind: "acode",
     data_source: "acode_transcript_hook",
+    "ai_otel.machine_id": options.machineId || "",
     "session.id": session.session_id,
     "gen_ai.conversation.id": session.conversation_id || session.session_id,
     "gen_ai.request.model": turn.model || session.model,

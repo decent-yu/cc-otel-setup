@@ -82,9 +82,11 @@ function fileBodyKind(fileName) {
 }
 
 function fileToolKind(fileName) {
-  // CC 旧文件名保持 snapshot-<session>-...；Codex 快照由通用 snapshot
-  // 引擎写成 snapshot-codex-<session>-...。request/response 仍只来自 CC。
+  // CC 旧文件名保持 snapshot-<session>-...；其它工具快照由通用 snapshot
+  // 引擎写成 snapshot-<tool>-<session>-...。request/response 当前仍只来自 CC。
   if (/^snapshot-codex-/i.test(fileName)) return "codex";
+  if (/^snapshot-acode-/i.test(fileName)) return "acode";
+  if (/^(?:body-)?acode-/i.test(fileName)) return "acode";
   return "cc";
 }
 

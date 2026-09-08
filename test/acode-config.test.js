@@ -45,6 +45,11 @@ test("installAcode writes endpoint and AStudio hooks while preserving user hooks
     "http://127.0.0.1:4317",
     "http",
     { email: "alice@example.invalid" },
+    {
+      machineId: "machine-acode",
+      fullUpload: true,
+      rawBodiesDir: path.join(home, ".claude", "cc-otel", "raw-bodies"),
+    },
   );
 
   assert.equal(result.status, "installed");
@@ -52,8 +57,12 @@ test("installAcode writes endpoint and AStudio hooks while preserving user hooks
   const endpoint = JSON.parse(fs.readFileSync(path.join(installDir, "endpoint.json"), "utf8"));
   assert.equal(endpoint.logsEndpoint, "http://127.0.0.1:4318/v1/logs");
   assert.equal(endpoint.toolKind, "acode");
+  assert.equal(endpoint.machineId, "machine-acode");
+  assert.equal(endpoint.fullUpload, true);
+  assert.match(endpoint.rawBodiesDir, /raw-bodies$/);
   assert.ok(fs.existsSync(path.join(installDir, "on-session-start.js")));
   assert.ok(fs.existsSync(path.join(installDir, "transcript-parser.js")));
+  assert.ok(fs.existsSync(path.join(installDir, "git-snapshot.js")));
 
   const config = fs.readFileSync(configPath, "utf8");
   assert.match(config, /\[model_providers\.example\]/);
@@ -90,6 +99,18 @@ test("installAcode is idempotent and replaces only its managed hooks", () => {
   const config = fs.readFileSync(path.join(home, ".acode", "config.toml"), "utf8");
   assert.equal((config.match(/hooks\.state\..*user_prompt_submit:0:0/g) || []).length, 2);
   assert.equal((config.match(/hooks\.state\..*stop:0:0/g) || []).length, 2);
-  assert.match(config, /acode-home-overlay\\\\hooks\.json:user_prompt_submit:0:0/);
-  assert.match(config, /acode-home-overlay\\\\hooks\.json:stop:0:0/);
+  assert.match(config, /acode-home-overlay(?:\\\\|\/)hooks\.json:user_prompt_submit:0:0/);
+  assert.match(config, /acode-home-overlay(?:\\\\|\/)hooks\.json:stop:0:0/);
+});
+
+test("installAcode persists the full-upload opt-out", () => {
+  const home = tempHome();
+  __test__.installAcode(home, "http://127.0.0.1:4317", "http", { email: "a@example.invalid" }, {
+    machineId: "machine-opt-out",
+    fullUpload: false,
+    rawBodiesDir: "",
+  });
+  const endpoint = JSON.parse(fs.readFileSync(path.join(home, ".acode", "ai-otel", "endpoint.json"), "utf8"));
+  assert.equal(endpoint.fullUpload, false);
+  assert.equal(endpoint.rawBodiesDir, "");
 });
